@@ -153,9 +153,21 @@ step_discover() {
 
     local query_output
     if ! query_output=$(az graph query -q "$kql" --first 1000 --subscriptions "$SUB_ID" -o json 2>&1); then
-        fail "KQL query failed:"
-        echo -e "  ${DIM}${query_output}${NC}"
-        exit 1
+        if echo "$query_output" | grep -qi "AADSTS\|login\|authentication\|expired\|multi-factor"; then
+            warn "Authentication token expired or MFA required."
+            warn "Re-authenticating...\n"
+            az login --tenant "$TENANT_ID" --scope "https://management.core.windows.net//.default"
+            echo ""
+            if ! query_output=$(az graph query -q "$kql" --first 1000 --subscriptions "$SUB_ID" -o json 2>&1); then
+                fail "KQL query still failed after re-auth:"
+                echo -e "  ${DIM}${query_output}${NC}"
+                exit 1
+            fi
+        else
+            fail "KQL query failed:"
+            echo -e "  ${DIM}${query_output}${NC}"
+            exit 1
+        fi
     fi
     STORAGE_JSON="$query_output"
 
