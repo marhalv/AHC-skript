@@ -1,0 +1,11 @@
+{
+  "ipRules": [],
+  "ipv6Rules": [],
+  "resourceAccessRules": [
+    {
+      "resourceId": "/subscriptions/d3318b81-2474-4a75-8053-9c0ffd9d7188/providers/Microsoft.Security/datascanners/StorageDataScanner",
+      "tenantId": "65f51067-7d65-4aa9-b996-4cc43a0d7111"
+    }
+  ],
+  "virtualNetworkRules": []
+}
