@@ -620,9 +620,268 @@ step_execute() {
 }
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-banner
-step_authenticate
-step_check_infra
-step_discover
-step_confirm_and_backup
-step_execute
+
+usage() {
+    echo -e "  Usage: ${BOLD}./screamtest.sh${NC} [command]"
+    echo ""
+    echo -e "  Commands:"
+    echo -e "    ${CYAN}(none)${NC}    Run the scream test"
+    echo -e "    ${CYAN}restore${NC}   Restore storage accounts from a backup"
+    echo ""
+}
+
+# ── RESTORE — Revert storage accounts to their exact previous config ─────────
+cmd_restore() {
+    banner
+    echo -e "${BOLD}${YELLOW}━━ RESTORE MODE ━━${NC}\n"
+
+    # Ensure logged in
+    if ! az account show &>/dev/null; then
+        warn "Not logged in to Azure CLI — launching ${CYAN}az login${NC}..."
+        az login
+    fi
+
+    # List available backups
+    if [[ ! -d "$BACKUP_DIR" ]] || [[ -z "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
+        fail "No backups found in ${BACKUP_DIR}/"
+        exit 1
+    fi
+
+    info "Available backups:\n"
+
+    local backup_dirs=()
+    local i=1
+    for d in "$BACKUP_DIR"/*/; do
+        [[ -d "$d" ]] || continue
+        local dirname
+        dirname=$(basename "$d")
+        local file_count
+        file_count=$(find "$d" -name "*_full-config.json" | wc -l | tr -d ' ')
+        local accounts
+        accounts=$(find "$d" -name "*_full-config.json" -exec basename {} '_full-config.json' \; | sort | paste -sd ', ' -)
+        printf "  ${BOLD}%-5s${NC} %-22s ${DIM}(%s account(s): %s)${NC}\n" "$i)" "$dirname" "$file_count" "$accounts"
+        backup_dirs+=("$d")
+        i=$((i + 1))
+    done
+
+    if [[ ${#backup_dirs[@]} -eq 0 ]]; then
+        fail "No backup directories found."
+        exit 1
+    fi
+
+    echo ""
+    read -rp "  Select backup number: " backup_num
+
+    if ! [[ "$backup_num" =~ ^[0-9]+$ ]] || (( backup_num < 1 || backup_num > ${#backup_dirs[@]} )); then
+        fail "Invalid selection."
+        exit 1
+    fi
+
+    local chosen_dir="${backup_dirs[$((backup_num - 1))]}"
+    local chosen_name
+    chosen_name=$(basename "$chosen_dir")
+
+    echo ""
+    info "Selected backup: ${BOLD}${chosen_name}${NC}\n"
+
+    # Find all full-config backups in this directory
+    local configs=()
+    for cfg in "$chosen_dir"/*_full-config.json; do
+        [[ -f "$cfg" ]] || continue
+        configs+=("$cfg")
+    done
+
+    if [[ ${#configs[@]} -eq 0 ]]; then
+        fail "No config backups found in ${chosen_dir}"
+        exit 1
+    fi
+
+    # Show what will be restored
+    echo -e "  ${BOLD}The following accounts will be restored to their exact backed-up config:${NC}\n"
+
+    printf "  ${BOLD}%-5s %-32s %-22s %-14s %-14s %-10s${NC}\n" \
+           "#" "NAME" "RESOURCE GROUP" "PUBLIC ACCESS" "DEFAULT ACT" "BYPASS"
+    line
+
+    local restore_items=()
+    local ri=1
+    for cfg in "${configs[@]}"; do
+        local sa_name sa_rg pub_access default_action bypass
+        sa_name=$(jq -r '.name' "$cfg")
+        sa_rg=$(jq -r '.resourceGroup' "$cfg")
+        pub_access=$(jq -r '.publicNetworkAccess // "Enabled"' "$cfg")
+        default_action=$(jq -r '.networkRuleSet.defaultAction // "Allow"' "$cfg")
+        bypass=$(jq -r '.networkRuleSet.bypass // "AzureServices"' "$cfg")
+
+        printf "  %-5s %-32s %-22s %-14s %-14s %-10s\n" \
+               "$ri" "$sa_name" "$sa_rg" "$pub_access" "$default_action" "$bypass"
+
+        restore_items+=("${cfg}")
+        ri=$((ri + 1))
+    done
+
+    echo ""
+
+    # Check for NSP associations to remove
+    local nsp_extension_present=false
+    if az extension show --name nsp &>/dev/null; then
+        nsp_extension_present=true
+    fi
+
+    local nsp_assocs_to_remove=()
+    if [[ "$nsp_extension_present" == true ]]; then
+        if az network perimeter show -n "$NSP_NAME" -g "$NSP_RG" &>/dev/null 2>&1; then
+            info "Checking for NSP associations to remove...\n"
+            local all_assocs
+            all_assocs=$(az network perimeter association list \
+                --perimeter-name "$NSP_NAME" -g "$NSP_RG" -o json 2>/dev/null || echo "[]")
+
+            for cfg in "${configs[@]}"; do
+                local sa_id
+                sa_id=$(jq -r '.id' "$cfg")
+                local assoc_name
+                assoc_name=$(echo "$all_assocs" | jq -r ".[] | select(.properties.privateLinkResource.id == \"$sa_id\") | .name // empty")
+                if [[ -n "$assoc_name" ]]; then
+                    nsp_assocs_to_remove+=("$assoc_name")
+                    ok "Will remove NSP association: ${CYAN}${assoc_name}${NC}"
+                fi
+            done
+            echo ""
+        fi
+    fi
+
+    echo -e "  ${RED}${BOLD}Type 'RESTORE' to confirm:${NC}"
+    echo ""
+    read -rp "  > " restore_confirm
+
+    if [[ "$restore_confirm" != "RESTORE" ]]; then
+        echo -e "\n  ${RED}Aborted.${NC}\n"
+        exit 1
+    fi
+
+    echo ""
+
+    # Remove NSP associations first
+    for aname in "${nsp_assocs_to_remove[@]}"; do
+        echo -ne "  ⏳  Removing NSP association ${BOLD}${aname}${NC} ... "
+        if az network perimeter association delete \
+            -n "$aname" \
+            --perimeter-name "$NSP_NAME" \
+            -g "$NSP_RG" \
+            --yes -o none 2>/dev/null; then
+            echo -e "${GREEN}removed ✔${NC}"
+        else
+            echo -e "${YELLOW}not found / already removed${NC}"
+        fi
+    done
+
+    # Restore each storage account
+    for cfg in "${restore_items[@]}"; do
+        local sa_name sa_rg pub_access default_action bypass
+        sa_name=$(jq -r '.name' "$cfg")
+        sa_rg=$(jq -r '.resourceGroup' "$cfg")
+        pub_access=$(jq -r '.publicNetworkAccess // "Enabled"' "$cfg")
+        default_action=$(jq -r '.networkRuleSet.defaultAction // "Allow"' "$cfg")
+        bypass=$(jq -r '.networkRuleSet.bypass // "AzureServices"' "$cfg")
+
+        echo -ne "  ⏳  ${BOLD}${sa_name}${NC} — restoring network config ... "
+
+        local restore_err
+        if restore_err=$(az storage account update \
+            --name "$sa_name" \
+            --resource-group "$sa_rg" \
+            --public-network-access "$pub_access" \
+            --default-action "$default_action" \
+            --bypass "$bypass" \
+            -o none 2>&1); then
+            echo -e "${GREEN}restored ✔${NC}"
+        else
+            echo -e "${RED}FAILED ✘${NC}"
+            echo -e "    ${DIM}${restore_err}${NC}"
+        fi
+
+        # Restore IP rules from network-rules backup
+        local net_rules_file="${cfg/_full-config.json/_network-rules.json}"
+        if [[ -f "$net_rules_file" ]]; then
+            # Restore IP rules
+            local ip_count
+            ip_count=$(jq '.ipRules | length' "$net_rules_file")
+            if [[ "$ip_count" -gt 0 ]]; then
+                for ipi in $(seq 0 $((ip_count - 1))); do
+                    local ip_addr
+                    ip_addr=$(jq -r ".ipRules[$ipi].ipAddressOrRange" "$net_rules_file")
+                    az storage account network-rule add \
+                        --account-name "$sa_name" \
+                        --resource-group "$sa_rg" \
+                        --ip-address "$ip_addr" \
+                        -o none 2>/dev/null || true
+                done
+                echo -e "    ↳ Restored ${ip_count} IP rule(s)"
+            fi
+
+            # Restore VNet rules
+            local vnet_count
+            vnet_count=$(jq '.virtualNetworkRules | length' "$net_rules_file")
+            if [[ "$vnet_count" -gt 0 ]]; then
+                for vni in $(seq 0 $((vnet_count - 1))); do
+                    local subnet_id
+                    subnet_id=$(jq -r ".virtualNetworkRules[$vni].virtualNetworkResourceId // .virtualNetworkRules[$vni].id" "$net_rules_file")
+                    az storage account network-rule add \
+                        --account-name "$sa_name" \
+                        --resource-group "$sa_rg" \
+                        --subnet "$subnet_id" \
+                        -o none 2>/dev/null || true
+                done
+                echo -e "    ↳ Restored ${vnet_count} VNet rule(s)"
+            fi
+
+            # Restore resource access rules
+            local rar_count
+            rar_count=$(jq '.resourceAccessRules | length' "$net_rules_file")
+            if [[ "$rar_count" -gt 0 ]]; then
+                for rari in $(seq 0 $((rar_count - 1))); do
+                    local res_id tenant_id
+                    res_id=$(jq -r ".resourceAccessRules[$rari].resourceId" "$net_rules_file")
+                    tenant_id=$(jq -r ".resourceAccessRules[$rari].tenantId" "$net_rules_file")
+                    az storage account network-rule add \
+                        --account-name "$sa_name" \
+                        --resource-group "$sa_rg" \
+                        --resource-id "$res_id" \
+                        --tenant-id "$tenant_id" \
+                        -o none 2>/dev/null || true
+                done
+                echo -e "    ↳ Restored ${rar_count} resource access rule(s)"
+            fi
+        fi
+    done
+
+    echo ""
+    line
+    echo ""
+    ok "${BOLD}Restore complete.${NC} All accounts reverted to their backed-up configuration."
+    echo ""
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+case "${1:-}" in
+    restore)
+        cmd_restore
+        ;;
+    help|--help|-h)
+        banner
+        usage
+        ;;
+    "")
+        banner
+        step_authenticate
+        step_check_infra
+        step_discover
+        step_confirm_and_backup
+        step_execute
+        ;;
+    *)
+        fail "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
