@@ -152,14 +152,26 @@ step_discover() {
 | where type =~ 'microsoft.storage/storageaccounts'
 | where subscriptionId == '$SUB_ID'
 | project name, resourceGroup, location, subscriptionId,
-          sku = sku.name, kind,
-          publicAccess = coalesce(properties.publicNetworkAccess, 'Enabled')
+          sku = tostring(sku.name), kind,
+          publicAccess = iff(isnotempty(properties.publicNetworkAccess), tostring(properties.publicNetworkAccess), 'Enabled')
 | order by name asc"
 
     info "Running KQL query via Azure Resource Graph...\n"
 
-    STORAGE_JSON=$(az graph query -q "$kql" --first 1000 -o json 2>/dev/null)
-    STORAGE_COUNT=$(echo "$STORAGE_JSON" | jq '.count')
+    local query_output
+    if ! query_output=$(az graph query -q "$kql" --first 1000 -o json 2>&1); then
+        fail "KQL query failed:"
+        echo -e "  ${DIM}${query_output}${NC}"
+        exit 1
+    fi
+    STORAGE_JSON="$query_output"
+
+    STORAGE_COUNT=$(echo "$STORAGE_JSON" | jq '.count // (.data | length)')
+
+    if [[ -z "$STORAGE_COUNT" || "$STORAGE_COUNT" == "null" || "$STORAGE_COUNT" -eq 0 ]]; then
+        warn "No storage accounts found in subscription ${BOLD}${SUB_NAME}${NC}."
+        exit 0
+    fi
 
     if [[ "$STORAGE_COUNT" -eq 0 ]]; then
         warn "No storage accounts found in subscription ${BOLD}${SUB_NAME}${NC}."
