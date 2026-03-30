@@ -147,19 +147,12 @@ step_check_infra() {
 step_discover() {
     echo -e "\n${BOLD}${YELLOW}━━ STEP 3: Discovering Storage Accounts (KQL) ━━${NC}\n"
 
-    local kql
-    kql="resources
-| where type =~ 'microsoft.storage/storageaccounts'
-| where subscriptionId == '$SUB_ID'
-| project name, resourceGroup, location, subscriptionId,
-          sku = tostring(sku.name), kind,
-          publicAccess = iff(isnotempty(properties.publicNetworkAccess), tostring(properties.publicNetworkAccess), 'Enabled')
-| order by name asc"
+    local kql="resources | where type =~ 'microsoft.storage/storageaccounts' | project name, resourceGroup, location, subscriptionId, sku = tostring(sku.name), kind, publicAccess = iff(isnotempty(properties.publicNetworkAccess), tostring(properties.publicNetworkAccess), 'Enabled') | order by name asc"
 
-    info "Running KQL query via Azure Resource Graph...\n"
+    info "Running KQL query via Azure Resource Graph (all subscriptions)...\n"
 
     local query_output
-    if ! query_output=$(az graph query -q "$kql" --first 1000 -o json 2>&1); then
+    if ! query_output=$(az graph query -q "$kql" --first 1000 --subscriptions "$SUB_ID" -o json 2>&1); then
         fail "KQL query failed:"
         echo -e "  ${DIM}${query_output}${NC}"
         exit 1
