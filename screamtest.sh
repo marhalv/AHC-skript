@@ -2,22 +2,23 @@
 set -euo pipefail
 
 ###############################################################################
-#  STORAGE ACCOUNT SCREAM TEST — NSP Edition
+#  STORAGE ACCOUNT SCREAM TEST
 #  ---------------------------------------------------------------------------
-#  Uses Azure Network Security Perimeter (NSP) to isolate storage accounts.
+#  Isolate storage accounts from the internet before permanent deletion.
+#
+#  Two isolation methods:
+#    • NSP (Network Security Perimeter) — centralised, supports Learning mode
+#    • Firewall — simple, sets publicNetworkAccess=Disabled + defaultAction=Deny
 #
 #  Flow:
 #    1. Authenticate & show tenant/subscription context
-#    2. Verify tooling (nsp extension, resource-graph, jq) + NSP infra
+#    2. Verify tooling, choose isolation method, set up infra (if NSP)
 #    3. Discover all storage accounts via KQL → user picks targets
 #    4. Back up configs, show impact, confirm
-#    5. Associate selected accounts to the NSP in Enforced mode
+#    5. Execute isolation
 #
-#  Why NSP?
-#    • Centralised control — one perimeter governs all associated resources
-#    • Learning mode available — logs what WOULD be blocked first
-#    • Easy rollback — remove the association to restore access instantly
-#    • Works across PaaS (storage, key vault, SQL, etc.)
+#  Rollback:
+#    ./screamtest.sh restore   — reverts accounts to their exact backed-up config
 ###############################################################################
 
 # ── Colours & formatting ─────────────────────────────────────────────────────
@@ -33,17 +34,20 @@ NC='\033[0m'
 BACKUP_DIR="./screamtest-backups"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
-# NSP defaults — the script will create these if they don't exist
+# NSP defaults — only used when NSP method is chosen
 NSP_RG="rg-screamtest-nsp"
 NSP_NAME="nsp-screamtest"
 NSP_PROFILE="profile-screamtest-deny-all"
+
+# Will be set during step 2
+ISOLATION_METHOD=""   # "nsp" or "firewall"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 banner() {
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}  ${BOLD}STORAGE ACCOUNT SCREAM TEST${NC}  ${DIM}(NSP Edition)${NC}                      ${CYAN}║${NC}"
-    echo -e "${CYAN}║${NC}  ${DIM}NSP Enforced → wait → if nothing screams → delete${NC}              ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${BOLD}STORAGE ACCOUNT SCREAM TEST${NC}                                    ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}  ${DIM}Isolate → wait → if nothing screams → delete${NC}                    ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 }
@@ -122,9 +126,9 @@ step_authenticate() {
     fi
 }
 
-# ── STEP 2 — Verify tooling & NSP infrastructure ─────────────────────────────
+# ── STEP 2 — Verify tooling, choose method, set up infra ─────────────────────
 step_check_infra() {
-    echo -e "\n${BOLD}${YELLOW}━━ STEP 2: Checking Required Infrastructure ━━${NC}\n"
+    echo -e "\n${BOLD}${YELLOW}━━ STEP 2: Tooling & Isolation Method ━━${NC}\n"
 
     # -- jq --
     if ! command -v jq &>/dev/null; then
@@ -155,21 +159,6 @@ step_check_infra() {
         ok "resource-graph extension present"
     fi
 
-    # -- nsp extension --
-    if ! az extension show --name nsp &>/dev/null; then
-        warn "Extension ${CYAN}nsp${NC} is not installed."
-        read -rp "  Install now? (y/n): " install_nsp
-        if [[ "$install_nsp" == "y" || "$install_nsp" == "Y" ]]; then
-            az extension add --name nsp --only-show-errors
-            ok "nsp extension installed"
-        else
-            fail "Cannot continue without the nsp extension."
-            exit 1
-        fi
-    else
-        ok "nsp extension present"
-    fi
-
     # -- Backup directory --
     if [[ ! -d "$BACKUP_DIR" ]]; then
         warn "Backup directory ${CYAN}${BACKUP_DIR}${NC} does not exist."
@@ -188,89 +177,133 @@ step_check_infra() {
     line
     echo ""
 
-    # ── NSP Infrastructure ────────────────────────────────────────────────────
-    info "Checking NSP infrastructure...\n"
-    info "  Resource Group:  ${BOLD}${NSP_RG}${NC}"
-    info "  Perimeter:       ${BOLD}${NSP_NAME}${NC}"
-    info "  Profile:         ${BOLD}${NSP_PROFILE}${NC}"
+    # ── Choose isolation method ───────────────────────────────────────────────
+    echo -e "  ${BOLD}Choose isolation method:${NC}\n"
+    echo -e "    ${CYAN}1)${NC} ${BOLD}NSP${NC}  (Network Security Perimeter)"
+    echo -e "       ${DIM}Centralised perimeter with Learning + Enforced modes.${NC}"
+    echo -e "       ${DIM}Supports dry-run (Learning logs what would be blocked).${NC}"
+    echo -e "       ${DIM}Rollback = remove association. Requires nsp extension.${NC}"
+    echo ""
+    echo -e "    ${CYAN}2)${NC} ${BOLD}Firewall${NC}  (publicNetworkAccess = Disabled)"
+    echo -e "       ${DIM}Simple and direct — flips the firewall switch.${NC}"
+    echo -e "       ${DIM}No dry-run available. Rollback = restore original config.${NC}"
+    echo ""
+    read -rp "  Method [1/2]: " method_choice
+
+    case "$method_choice" in
+        1) ISOLATION_METHOD="nsp" ;;
+        2) ISOLATION_METHOD="firewall" ;;
+        *)
+            fail "Invalid choice. Pick 1 or 2."
+            exit 1
+            ;;
+    esac
+
     echo ""
 
-    # -- Resource Group --
-    if ! az group show --name "$NSP_RG" &>/dev/null; then
-        warn "Resource group ${CYAN}${NSP_RG}${NC} does not exist."
-        read -rp "  Create it? (y/n): " create_rg
-        if [[ "$create_rg" == "y" || "$create_rg" == "Y" ]]; then
-            read -rp "  Location (e.g. norwayeast, westeurope): " rg_location
-            az group create --name "$NSP_RG" --location "$rg_location" -o none
-            ok "Resource group ${CYAN}${NSP_RG}${NC} created in ${rg_location}"
-            NSP_LOCATION="$rg_location"
+    # ── NSP-specific setup ────────────────────────────────────────────────────
+    if [[ "$ISOLATION_METHOD" == "nsp" ]]; then
+        # -- nsp extension --
+        if ! az extension show --name nsp &>/dev/null; then
+            warn "Extension ${CYAN}nsp${NC} is not installed."
+            read -rp "  Install now? (y/n): " install_nsp
+            if [[ "$install_nsp" == "y" || "$install_nsp" == "Y" ]]; then
+                az extension add --name nsp --only-show-errors
+                ok "nsp extension installed"
+            else
+                fail "Cannot continue without the nsp extension."
+                exit 1
+            fi
         else
-            fail "Cannot proceed without resource group."
-            exit 1
+            ok "nsp extension present"
         fi
-    else
-        ok "Resource group ${CYAN}${NSP_RG}${NC} exists"
-        NSP_LOCATION=$(az group show --name "$NSP_RG" --query location -o tsv)
-    fi
 
-    # -- Network Security Perimeter --
-    if ! az network perimeter show -n "$NSP_NAME" -g "$NSP_RG" &>/dev/null; then
-        warn "NSP ${CYAN}${NSP_NAME}${NC} does not exist."
-        read -rp "  Create it? (y/n): " create_nsp
-        if [[ "$create_nsp" == "y" || "$create_nsp" == "Y" ]]; then
-            az network perimeter create -n "$NSP_NAME" -g "$NSP_RG" -l "$NSP_LOCATION" -o none
-            ok "NSP ${CYAN}${NSP_NAME}${NC} created"
-        else
-            fail "Cannot proceed without NSP."
-            exit 1
-        fi
-    else
-        ok "NSP ${CYAN}${NSP_NAME}${NC} exists"
-    fi
-
-    # Get the NSP ARM ID for later use
-    NSP_ID=$(az network perimeter show -n "$NSP_NAME" -g "$NSP_RG" --query id -o tsv)
-
-    # -- NSP Profile (deny-all = no access rules) --
-    if ! az network perimeter profile show --perimeter-name "$NSP_NAME" -g "$NSP_RG" -n "$NSP_PROFILE" &>/dev/null; then
-        warn "Profile ${CYAN}${NSP_PROFILE}${NC} does not exist."
-        read -rp "  Create it? (y/n): " create_profile
-        if [[ "$create_profile" == "y" || "$create_profile" == "Y" ]]; then
-            az network perimeter profile create \
-                --perimeter-name "$NSP_NAME" \
-                -g "$NSP_RG" \
-                -n "$NSP_PROFILE" \
-                -o none
-            ok "Profile ${CYAN}${NSP_PROFILE}${NC} created (no access rules = deny all)"
-        else
-            fail "Cannot proceed without NSP profile."
-            exit 1
-        fi
-    else
-        ok "Profile ${CYAN}${NSP_PROFILE}${NC} exists"
-    fi
-
-    # Get the profile ARM ID
-    PROFILE_ID=$(az network perimeter profile show \
-        --perimeter-name "$NSP_NAME" -g "$NSP_RG" -n "$NSP_PROFILE" \
-        --query id -o tsv)
-
-    # Verify there are no access rules (profile should deny everything)
-    local rule_count
-    rule_count=$(az network perimeter profile access-rule list \
-        --perimeter-name "$NSP_NAME" -g "$NSP_RG" --profile-name "$NSP_PROFILE" \
-        -o json 2>/dev/null | jq 'length')
-    if [[ "$rule_count" -gt 0 ]]; then
-        warn "Profile has ${BOLD}${rule_count}${NC} access rule(s). For a true scream test it should have none."
-        echo -e "  ${DIM}  Rules allow traffic through the perimeter. Review with:${NC}"
-        echo -e "  ${DIM}  az network perimeter profile access-rule list --perimeter-name $NSP_NAME -g $NSP_RG --profile-name $NSP_PROFILE${NC}"
         echo ""
-        read -rp "  Continue anyway? (y/n): " cont_rules
-        if [[ "$cont_rules" != "y" && "$cont_rules" != "Y" ]]; then
-            exit 1
+        info "Setting up NSP infrastructure...\n"
+        info "  Resource Group:  ${BOLD}${NSP_RG}${NC}"
+        info "  Perimeter:       ${BOLD}${NSP_NAME}${NC}"
+        info "  Profile:         ${BOLD}${NSP_PROFILE}${NC}"
+        echo ""
+
+        # -- Resource Group --
+        if ! az group show --name "$NSP_RG" &>/dev/null; then
+            warn "Resource group ${CYAN}${NSP_RG}${NC} does not exist."
+            read -rp "  Create it? (y/n): " create_rg
+            if [[ "$create_rg" == "y" || "$create_rg" == "Y" ]]; then
+                read -rp "  Location (e.g. norwayeast, westeurope): " rg_location
+                az group create --name "$NSP_RG" --location "$rg_location" -o none
+                ok "Resource group ${CYAN}${NSP_RG}${NC} created in ${rg_location}"
+                NSP_LOCATION="$rg_location"
+            else
+                fail "Cannot proceed without resource group."
+                exit 1
+            fi
+        else
+            ok "Resource group ${CYAN}${NSP_RG}${NC} exists"
+            NSP_LOCATION=$(az group show --name "$NSP_RG" --query location -o tsv)
+        fi
+
+        # -- Network Security Perimeter --
+        if ! az network perimeter show -n "$NSP_NAME" -g "$NSP_RG" &>/dev/null; then
+            warn "NSP ${CYAN}${NSP_NAME}${NC} does not exist."
+            read -rp "  Create it? (y/n): " create_nsp
+            if [[ "$create_nsp" == "y" || "$create_nsp" == "Y" ]]; then
+                az network perimeter create -n "$NSP_NAME" -g "$NSP_RG" -l "$NSP_LOCATION" -o none
+                ok "NSP ${CYAN}${NSP_NAME}${NC} created"
+            else
+                fail "Cannot proceed without NSP."
+                exit 1
+            fi
+        else
+            ok "NSP ${CYAN}${NSP_NAME}${NC} exists"
+        fi
+
+        # Get the NSP ARM ID for later use
+        NSP_ID=$(az network perimeter show -n "$NSP_NAME" -g "$NSP_RG" --query id -o tsv)
+
+        # -- NSP Profile (deny-all = no access rules) --
+        if ! az network perimeter profile show --perimeter-name "$NSP_NAME" -g "$NSP_RG" -n "$NSP_PROFILE" &>/dev/null; then
+            warn "Profile ${CYAN}${NSP_PROFILE}${NC} does not exist."
+            read -rp "  Create it? (y/n): " create_profile
+            if [[ "$create_profile" == "y" || "$create_profile" == "Y" ]]; then
+                az network perimeter profile create \
+                    --perimeter-name "$NSP_NAME" \
+                    -g "$NSP_RG" \
+                    -n "$NSP_PROFILE" \
+                    -o none
+                ok "Profile ${CYAN}${NSP_PROFILE}${NC} created (no access rules = deny all)"
+            else
+                fail "Cannot proceed without NSP profile."
+                exit 1
+            fi
+        else
+            ok "Profile ${CYAN}${NSP_PROFILE}${NC} exists"
+        fi
+
+        # Get the profile ARM ID
+        PROFILE_ID=$(az network perimeter profile show \
+            --perimeter-name "$NSP_NAME" -g "$NSP_RG" -n "$NSP_PROFILE" \
+            --query id -o tsv)
+
+        # Verify there are no access rules (profile should deny everything)
+        local rule_count
+        rule_count=$(az network perimeter profile access-rule list \
+            --perimeter-name "$NSP_NAME" -g "$NSP_RG" --profile-name "$NSP_PROFILE" \
+            -o json 2>/dev/null | jq 'length')
+        if [[ "$rule_count" -gt 0 ]]; then
+            warn "Profile has ${BOLD}${rule_count}${NC} access rule(s). For a true scream test it should have none."
+            echo -e "  ${DIM}  Rules allow traffic through the perimeter. Review with:${NC}"
+            echo -e "  ${DIM}  az network perimeter profile access-rule list --perimeter-name $NSP_NAME -g $NSP_RG --profile-name $NSP_PROFILE${NC}"
+            echo ""
+            read -rp "  Continue anyway? (y/n): " cont_rules
+            if [[ "$cont_rules" != "y" && "$cont_rules" != "Y" ]]; then
+                exit 1
+            fi
+        else
+            ok "Profile has ${BOLD}0${NC} access rules (deny-all)"
         fi
     else
-        ok "Profile has ${BOLD}0${NC} access rules (deny-all)"
+        ok "Firewall method selected — no extra infrastructure needed"
     fi
 
     line
@@ -295,43 +328,53 @@ step_discover() {
 
     ok "Found ${BOLD}${STORAGE_COUNT}${NC} storage account(s)\n"
 
-    # Check existing NSP associations to show status
-    local existing_assoc
-    existing_assoc=$(az network perimeter association list \
-        --perimeter-name "$NSP_NAME" -g "$NSP_RG" -o json 2>/dev/null || echo "[]")
+    # Check existing NSP associations (only if using NSP method)
+    local existing_assoc="[]"
+    if [[ "$ISOLATION_METHOD" == "nsp" ]]; then
+        existing_assoc=$(az network perimeter association list \
+            --perimeter-name "$NSP_NAME" -g "$NSP_RG" -o json 2>/dev/null || echo "[]")
+    fi
 
     # Table header
-    printf "  ${BOLD}${DIM}%-5s %-32s %-22s %-14s %-10s %-10s${NC}\n" \
-           "#" "NAME" "RESOURCE GROUP" "LOCATION" "PUBLIC" "NSP"
+    if [[ "$ISOLATION_METHOD" == "nsp" ]]; then
+        printf "  ${BOLD}${DIM}%-5s %-32s %-22s %-14s %-10s %-10s${NC}\n" \
+               "#" "NAME" "RESOURCE GROUP" "LOCATION" "PUBLIC" "NSP"
+    else
+        printf "  ${BOLD}${DIM}%-5s %-32s %-22s %-14s %-10s${NC}\n" \
+               "#" "NAME" "RESOURCE GROUP" "LOCATION" "PUBLIC"
+    fi
     line
 
     for i in $(seq 0 $((STORAGE_COUNT - 1))); do
-        local sa_name sa_rg sa_loc sa_pub sa_id nsp_status
+        local sa_name sa_rg sa_loc sa_pub sa_id
         sa_name=$(echo "$STORAGE_JSON" | jq -r ".data[$i].name")
         sa_rg=$(echo "$STORAGE_JSON"   | jq -r ".data[$i].resourceGroup")
         sa_loc=$(echo "$STORAGE_JSON"  | jq -r ".data[$i].location")
         sa_pub=$(echo "$STORAGE_JSON"  | jq -r ".data[$i].publicAccess // \"Enabled\"")
         sa_id=$(echo "$STORAGE_JSON"   | jq -r ".data[$i].id")
 
-        # Check if already associated to our NSP
-        if echo "$existing_assoc" | jq -e ".[] | select(.properties.privateLinkResource.id == \"$sa_id\")" &>/dev/null; then
-            local mode
-            mode=$(echo "$existing_assoc" | jq -r ".[] | select(.properties.privateLinkResource.id == \"$sa_id\") | .properties.accessMode")
-            nsp_status="$mode"
-        else
-            nsp_status="-"
-        fi
-
         local num=$((i + 1))
         local pub_color="$GREEN"
         [[ "$sa_pub" == "Disabled" ]] && pub_color="$RED"
 
-        local nsp_color="$DIM"
-        [[ "$nsp_status" == "Enforced" ]] && nsp_color="$RED"
-        [[ "$nsp_status" == "Learning" ]] && nsp_color="$YELLOW"
+        if [[ "$ISOLATION_METHOD" == "nsp" ]]; then
+            local nsp_status="-"
+            if echo "$existing_assoc" | jq -e ".[] | select(.properties.privateLinkResource.id == \"$sa_id\")" &>/dev/null; then
+                local mode
+                mode=$(echo "$existing_assoc" | jq -r ".[] | select(.properties.privateLinkResource.id == \"$sa_id\") | .properties.accessMode")
+                nsp_status="$mode"
+            fi
 
-        printf "  %-5s %-32s %-22s %-14s ${pub_color}%-10s${NC} ${nsp_color}%-10s${NC}\n" \
-               "$num" "$sa_name" "$sa_rg" "$sa_loc" "$sa_pub" "$nsp_status"
+            local nsp_color="$DIM"
+            [[ "$nsp_status" == "Enforced" ]] && nsp_color="$RED"
+            [[ "$nsp_status" == "Learning" ]] && nsp_color="$YELLOW"
+
+            printf "  %-5s %-32s %-22s %-14s ${pub_color}%-10s${NC} ${nsp_color}%-10s${NC}\n" \
+                   "$num" "$sa_name" "$sa_rg" "$sa_loc" "$sa_pub" "$nsp_status"
+        else
+            printf "  %-5s %-32s %-22s %-14s ${pub_color}%-10s${NC}\n" \
+                   "$num" "$sa_name" "$sa_rg" "$sa_loc" "$sa_pub"
+        fi
     done
 
     echo ""
@@ -373,21 +416,25 @@ step_discover() {
 step_confirm_and_backup() {
     echo -e "\n${BOLD}${YELLOW}━━ STEP 4: Impact Review & Configuration Backup ━━${NC}\n"
 
-    # Choose mode
-    echo -e "  ${BOLD}Select NSP access mode:${NC}"
-    echo -e "    ${YELLOW}1)${NC} ${BOLD}Learning${NC}  — logs blocked traffic, does NOT actually block (dry run)"
-    echo -e "    ${RED}2)${NC} ${BOLD}Enforced${NC}  — blocks ALL public/internet traffic (real scream test)"
-    echo ""
-    read -rp "  Mode [1/2]: " mode_choice
+    # Choose mode (NSP only — firewall is always enforced)
+    if [[ "$ISOLATION_METHOD" == "nsp" ]]; then
+        echo -e "  ${BOLD}Select NSP access mode:${NC}"
+        echo -e "    ${YELLOW}1)${NC} ${BOLD}Learning${NC}  — logs blocked traffic, does NOT actually block (dry run)"
+        echo -e "    ${RED}2)${NC} ${BOLD}Enforced${NC}  — blocks ALL public/internet traffic (real scream test)"
+        echo ""
+        read -rp "  Mode [1/2]: " mode_choice
 
-    case "$mode_choice" in
-        1) NSP_MODE="Learning" ;;
-        2) NSP_MODE="Enforced" ;;
-        *)
-            fail "Invalid mode. Choose 1 or 2."
-            exit 1
-            ;;
-    esac
+        case "$mode_choice" in
+            1) NSP_MODE="Learning" ;;
+            2) NSP_MODE="Enforced" ;;
+            *)
+                fail "Invalid mode. Choose 1 or 2."
+                exit 1
+                ;;
+        esac
+    else
+        NSP_MODE="Enforced"   # firewall is always a hard block
+    fi
 
     echo ""
     if [[ "$NSP_MODE" == "Enforced" ]]; then
@@ -396,7 +443,10 @@ step_confirm_and_backup() {
         echo -e "  ${YELLOW}${BOLD}The following storage accounts will be monitored (Learning mode):${NC}\n"
     fi
 
-    printf "  ${BOLD}%-5s %-32s %-22s %-14s %-12s${NC}\n" "#" "NAME" "RESOURCE GROUP" "LOCATION" "MODE"
+    local mode_label="$NSP_MODE"
+    [[ "$ISOLATION_METHOD" == "firewall" ]] && mode_label="Firewall"
+
+    printf "  ${BOLD}%-5s %-32s %-22s %-14s %-12s${NC}\n" "#" "NAME" "RESOURCE GROUP" "LOCATION" "METHOD"
     line
 
     for idx in "${SELECTED_INDICES[@]}"; do
@@ -409,20 +459,29 @@ step_confirm_and_backup() {
         [[ "$NSP_MODE" == "Enforced" ]] && mode_color="$RED"
 
         printf "  ${mode_color}%-5s %-32s %-22s %-14s %-12s${NC}\n" \
-               "$((idx + 1))" "$sa_name" "$sa_rg" "$sa_loc" "$NSP_MODE"
+               "$((idx + 1))" "$sa_name" "$sa_rg" "$sa_loc" "$mode_label"
     done
 
     echo ""
     echo -e "  ${BOLD}What will happen:${NC}"
     echo -e "    1. Full configuration of each account → backed up to JSON"
     echo -e "    2. Network rules → backed up to JSON"
-    echo -e "    3. Each account gets associated to NSP ${CYAN}${NSP_NAME}${NC}"
-    echo -e "    4. Profile: ${CYAN}${NSP_PROFILE}${NC} (no access rules = deny all)"
-    echo -e "    5. Mode: ${BOLD}${NSP_MODE}${NC}"
+    if [[ "$ISOLATION_METHOD" == "nsp" ]]; then
+        echo -e "    3. Each account gets associated to NSP ${CYAN}${NSP_NAME}${NC}"
+        echo -e "    4. Profile: ${CYAN}${NSP_PROFILE}${NC} (no access rules = deny all)"
+        echo -e "    5. Mode: ${BOLD}${NSP_MODE}${NC}"
+    else
+        echo -e "    3. publicNetworkAccess → ${BOLD}Disabled${NC}"
+        echo -e "    4. defaultAction → ${BOLD}Deny${NC}"
+    fi
     echo ""
     echo -e "  ${CYAN}Backup location:${NC} ${BACKUP_DIR}/${TIMESTAMP}/"
     echo ""
-    echo -e "  ${BOLD}To rollback:${NC} ${DIM}remove the NSP association (shown at the end)${NC}"
+    if [[ "$ISOLATION_METHOD" == "nsp" ]]; then
+        echo -e "  ${BOLD}To rollback:${NC} ${DIM}remove the NSP association (shown at the end), or run ./screamtest.sh restore${NC}"
+    else
+        echo -e "  ${BOLD}To rollback:${NC} ${DIM}run ./screamtest.sh restore${NC}"
+    fi
     echo ""
 
     if [[ "$NSP_MODE" == "Enforced" ]]; then
@@ -444,6 +503,9 @@ step_confirm_and_backup() {
     # Create timestamped backup folder
     BACKUP_PATH="${BACKUP_DIR}/${TIMESTAMP}"
     mkdir -p "$BACKUP_PATH"
+
+    # Save isolation method to backup for restore reference
+    echo "$ISOLATION_METHOD" > "${BACKUP_PATH}/_method.txt"
 
     echo ""
     info "Backing up configurations...\n"
@@ -473,8 +535,79 @@ step_confirm_and_backup() {
     line
 }
 
-# ── STEP 5 — Associate to NSP (with legacy fallback) ─────────────────────────
+# ── STEP 5 — Execute isolation ────────────────────────────────────────────────
 step_execute() {
+    if [[ "$ISOLATION_METHOD" == "nsp" ]]; then
+        step_execute_nsp
+    else
+        step_execute_firewall
+    fi
+}
+
+step_execute_firewall() {
+    echo -e "\n${BOLD}${YELLOW}━━ STEP 5: Isolating via Firewall ━━${NC}\n"
+
+    local fw_success=()
+    local failed=()
+
+    for idx in "${SELECTED_INDICES[@]}"; do
+        local sa_name sa_rg
+        sa_name=$(echo "$STORAGE_JSON" | jq -r ".data[$idx].name")
+        sa_rg=$(echo "$STORAGE_JSON"   | jq -r ".data[$idx].resourceGroup")
+
+        echo -ne "  ⏳  ${BOLD}${sa_name}${NC} — disabling public access ... "
+
+        local fw_err
+        if fw_err=$(az storage account update \
+            --name "$sa_name" \
+            --resource-group "$sa_rg" \
+            --public-network-access Disabled \
+            --default-action Deny \
+            -o none 2>&1); then
+            echo -e "${GREEN}ISOLATED ✔${NC}"
+            fw_success+=("$sa_name ($sa_rg)")
+        else
+            echo -e "${RED}FAILED ✘${NC}"
+            echo -e "    ${DIM}${fw_err}${NC}"
+            failed+=("$sa_name ($sa_rg)")
+        fi
+    done
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    echo ""
+    line
+    echo -e "\n${BOLD}${YELLOW}━━ SCREAM TEST SUMMARY ━━${NC}\n"
+
+    echo -e "  ${BOLD}Method:${NC}  Firewall (publicNetworkAccess=Disabled, defaultAction=Deny)"
+    echo ""
+
+    if [[ ${#fw_success[@]} -gt 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}Isolated (${#fw_success[@]}):${NC}"
+        for sa in "${fw_success[@]}"; do
+            echo -e "    ${GREEN}✔${NC}  $sa"
+        done
+    fi
+
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        echo -e "\n  ${RED}${BOLD}Failed (${#failed[@]}):${NC}"
+        for sa in "${failed[@]}"; do
+            echo -e "    ${RED}✘${NC}  $sa"
+        done
+    fi
+
+    echo ""
+    line
+    echo ""
+    echo -e "  ${CYAN}Backups:${NC}  ${BACKUP_PATH}/"
+    echo ""
+    echo -e "  ${BOLD}Rollback:${NC}  ${DIM}./screamtest.sh restore${NC}"
+    echo ""
+    echo -e "  ${YELLOW}${BOLD}Now wait and monitor. If something screams — rollback.${NC}"
+    echo -e "  ${YELLOW}If nothing screams — safe to delete the storage accounts.${NC}"
+    echo ""
+}
+
+step_execute_nsp() {
     echo -e "\n${BOLD}${YELLOW}━━ STEP 5: Associating to Network Security Perimeter (${NSP_MODE}) ━━${NC}\n"
 
     local nsp_success=()
@@ -507,9 +640,9 @@ step_execute() {
             assoc_names+=("$assoc_name")
         else
             echo -e "${YELLOW}NSP incompatible${NC}"
-            # Extract short reason from error
+            # Extract short reason from error (macOS-compatible)
             local short_reason
-            short_reason=$(echo "$assoc_err" | grep -oP "(?<=Error message: ).*" | head -1)
+            short_reason=$(echo "$assoc_err" | sed -n 's/.*Error message: //p' | head -1)
             [[ -z "$short_reason" ]] && short_reason="$assoc_err"
             echo -e "    ${DIM}${short_reason}${NC}"
 
@@ -543,6 +676,7 @@ step_execute() {
     line
     echo -e "\n${BOLD}${YELLOW}━━ SCREAM TEST SUMMARY ━━${NC}\n"
 
+    echo -e "  ${BOLD}Method:${NC}     NSP"
     echo -e "  ${BOLD}Mode:${NC}       ${NSP_MODE}"
     echo -e "  ${BOLD}Perimeter:${NC}  ${NSP_NAME}"
     echo -e "  ${BOLD}Profile:${NC}    ${NSP_PROFILE} (deny-all)"
@@ -605,7 +739,9 @@ step_execute() {
         done
     fi
 
-    echo -e "  ${BOLD}To delete the entire NSP + all associations:${NC}"
+    echo -e "  ${BOLD}Full rollback:${NC}  ${DIM}./screamtest.sh restore${NC}"
+    echo ""
+    echo -e "  ${BOLD}Delete the entire NSP + all associations:${NC}"
     echo -e "  ${DIM}az network perimeter delete -n $NSP_NAME -g $NSP_RG --force-deletion true --yes${NC}"
     echo ""
 
@@ -659,7 +795,11 @@ cmd_restore() {
         file_count=$(find "$d" -name "*_full-config.json" | wc -l | tr -d ' ')
         local accounts
         accounts=$(find "$d" -name "*_full-config.json" -exec basename {} '_full-config.json' \; | sort | paste -sd ', ' -)
-        printf "  ${BOLD}%-5s${NC} %-22s ${DIM}(%s account(s): %s)${NC}\n" "$i)" "$dirname" "$file_count" "$accounts"
+        local method_label=""
+        if [[ -f "${d}_method.txt" ]]; then
+            method_label=" [$(cat "${d}_method.txt")]"
+        fi
+        printf "  ${BOLD}%-5s${NC} %-22s ${DIM}(%s account(s): %s)%s${NC}\n" "$i)" "$dirname" "$file_count" "$accounts" "$method_label"
         backup_dirs+=("$d")
         i=$((i + 1))
     done
